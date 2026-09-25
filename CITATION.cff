@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Saini"
+    given-names: "Eklavya"
+title: "violamake"
+version: "1.0.0"
+abstract: "A highly performant Go CLI tool that turns violin sheet music into a viola part by rewriting treble clef to alto clef and transposing everything down a perfect fifth."
+date-released: 2026-09-24
+url: "https://github.com"
+repository-code: "https://github.com"
+license: "MIT"
+keywords:
+  - "go"
+  - "golang"
+  - "viola"
+  - "violin"
+  - "sheet-music"
+  - "transposition"
+  - "musicxml"
+  - "omr"
