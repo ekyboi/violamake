@@ -203,7 +203,15 @@ func (p *Pipeline) Run(ctx context.Context) (Stats, error) {
 	}
 
 	transposedXML := filepath.Join(p.workDir, "transposed.musicxml")
-	st, err := p.runTranspose(rawXML, transposedXML)
+	// When the source is an engraved PDF it carries a text layer holding the
+	// chord symbols exactly as printed. Recognition reads those with OCR and
+	// can misread them, so the page's own text is used to correct the roots.
+	var corrections []chordCorrection
+	if p.needsOMR {
+		corrections = p.chordCorrections(rawXML)
+	}
+
+	st, err := p.runTranspose(rawXML, transposedXML, corrections)
 	if err != nil {
 		return st, err
 	}
@@ -303,7 +311,7 @@ func findExport(dir string) (string, error) {
 
 // runTranspose streams the recognized score through the native transformation.
 // Files are streamed rather than buffered so memory stays flat on large scores.
-func (p *Pipeline) runTranspose(inXML, outXML string) (Stats, error) {
+func (p *Pipeline) runTranspose(inXML, outXML string, corrections []chordCorrection) (Stats, error) {
 	var st Stats
 
 	in, err := os.Open(inXML)
@@ -322,7 +330,7 @@ func (p *Pipeline) runTranspose(inXML, outXML string) (Stats, error) {
 		return st, fmt.Errorf("writing MusicXML header: %w", err)
 	}
 
-	st, err = Transpose(in, out, p.PreservePitch)
+	st, err = TransposeWithCorrections(in, out, p.PreservePitch, corrections)
 	if err != nil {
 		return st, err
 	}
@@ -332,6 +340,36 @@ func (p *Pipeline) runTranspose(inXML, outXML string) (Stats, error) {
 
 	p.logf("transposed: %s", st)
 	return st, nil
+}
+
+// chordCorrections compares the chord symbols recognition produced against the
+// text layer of the source PDF and returns the roots that need restoring.
+//
+// Every failure here is non-fatal: a scanned PDF has no text layer, and a PDF
+// this library cannot parse is no reason to abandon a conversion that is
+// otherwise fine. In both cases the score proceeds on recognition alone.
+func (p *Pipeline) chordCorrections(recognizedXML string) []chordCorrection {
+	fromPDF, err := chordsBySystem(p.Input)
+	if err != nil {
+		p.logf("could not read the PDF text layer (%v); using recognized chords as-is", err)
+		return nil
+	}
+	if len(fromPDF) == 0 {
+		p.logf("no chord symbols in the PDF text layer; the source is probably a scan")
+		return nil
+	}
+
+	fromOMR, err := chordsFromMusicXML(recognizedXML)
+	if err != nil {
+		p.logf("could not read recognized chords (%v); skipping correction", err)
+		return nil
+	}
+
+	corrections := reconcileChords(fromPDF, fromOMR)
+	for _, c := range corrections {
+		p.logf("chord corrected from the page: %s -> %s", c.from, c.to)
+	}
+	return corrections
 }
 
 // xmlHeader restores the declaration and DOCTYPE that encoding/xml does not

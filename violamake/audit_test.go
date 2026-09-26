@@ -178,3 +178,127 @@ func TestUnknownStepIsAnError(t *testing.T) {
 		t.Error("expected an error for an unrecognized step")
 	}
 }
+
+// OMR frequently fails to link the instrument name printed on the page to the
+// staff, falling back to a placeholder. When the page itself names a violin,
+// the placeholder is corrected rather than left to mislabel the part.
+func TestGenericPartNameFixedFromCredit(t *testing.T) {
+	const score = `<score-partwise>
+<credit page="1"><credit-words>Violin</credit-words></credit>
+<part-list><score-part id="P1">
+<part-name>Voice</part-name>
+<part-abbreviation>Voice</part-abbreviation>
+<score-instrument id="P1-I1"><instrument-name>Voice Oohs</instrument-name></score-instrument>
+<midi-instrument id="P1-I1"><midi-program>54</midi-program></midi-instrument>
+</score-part></part-list></score-partwise>`
+
+	var out strings.Builder
+	if _, err := Transpose(strings.NewReader(score), &out, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+
+	if strings.Contains(got, "Voice") {
+		t.Errorf("placeholder part name survived:\n%s", got)
+	}
+	if !strings.Contains(got, "<part-name>Viola</part-name>") {
+		t.Errorf("part should be named Viola:\n%s", got)
+	}
+	if !strings.Contains(got, "<midi-program>42</midi-program>") {
+		t.Errorf("playback should use the viola patch:\n%s", got)
+	}
+}
+
+// Without a credit naming a violin there is no evidence the part is one, so a
+// placeholder is left exactly as found.
+func TestGenericPartNameLeftAloneWithoutCredit(t *testing.T) {
+	const score = `<score-partwise><part-list><score-part id="P1">
+<part-name>Voice</part-name>
+<midi-instrument id="P1-I1"><midi-program>54</midi-program></midi-instrument>
+</score-part></part-list></score-partwise>`
+
+	var out strings.Builder
+	if _, err := Transpose(strings.NewReader(score), &out, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "<part-name>Voice</part-name>") {
+		t.Errorf("part name should be untouched without evidence:\n%s", got)
+	}
+	if !strings.Contains(got, "<midi-program>54</midi-program>") {
+		t.Errorf("playback patch should be untouched:\n%s", got)
+	}
+}
+
+// A part with a real name that is not a violin is never renamed, even when a
+// violin credit appears elsewhere on the page -- a score may hold several
+// instruments and only the violin part becomes a viola part.
+func TestNamedNonViolinPartNeverRenamed(t *testing.T) {
+	const score = `<score-partwise>
+<credit page="1"><credit-words>Violin and Piano</credit-words></credit>
+<part-list><score-part id="P1"><part-name>Piano</part-name>
+<midi-instrument id="P1-I1"><midi-program>1</midi-program></midi-instrument>
+</score-part></part-list></score-partwise>`
+
+	var out strings.Builder
+	if _, err := Transpose(strings.NewReader(score), &out, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "<part-name>Piano</part-name>") {
+		t.Errorf("a named non-violin part must not be renamed:\n%s", got)
+	}
+	if !strings.Contains(got, "<midi-program>1</midi-program>") {
+		t.Errorf("a piano patch must not be reassigned:\n%s", got)
+	}
+}
+
+// OMR deposits unidentified page text in credits, including measure numbers
+// scraped off the left margin. Those print as stray lines in the header.
+func TestScrapedMeasureNumbersDropped(t *testing.T) {
+	const score = `<score-partwise>
+<credit page="1"><credit-words>Daisy Bell</credit-words></credit>
+<credit page="1"><credit-words>10</credit-words></credit>
+<credit page="1"><credit-words>18</credit-words></credit>
+<credit page="1"><credit-words>1901</credit-words></credit>
+</score-partwise>`
+
+	var out strings.Builder
+	st, err := Transpose(strings.NewReader(score), &out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+
+	if !strings.Contains(got, "Daisy Bell") {
+		t.Errorf("real credits must survive:\n%s", got)
+	}
+	if strings.Contains(got, ">10<") || strings.Contains(got, ">18<") {
+		t.Errorf("scraped measure numbers should be dropped:\n%s", got)
+	}
+	if st.DroppedCredits != 3 {
+		t.Errorf("DroppedCredits = %d, want 3", st.DroppedCredits)
+	}
+	// The wrapper goes too, leaving no empty <credit> shells.
+	if strings.Contains(got, "<credit page=\"1\"></credit>") {
+		t.Errorf("empty credit wrapper left behind:\n%s", got)
+	}
+}
+
+// Under --preserve-pitch the part is relabelled but playback is not touched,
+// since the sounding pitches are unchanged.
+func TestPreservePitchLeavesMidiProgram(t *testing.T) {
+	const score = `<score-partwise>
+<credit page="1"><credit-words>Violin</credit-words></credit>
+<part-list><score-part id="P1"><part-name>Voice</part-name>
+<midi-instrument id="P1-I1"><midi-program>54</midi-program></midi-instrument>
+</score-part></part-list></score-partwise>`
+
+	var out strings.Builder
+	if _, err := Transpose(strings.NewReader(score), &out, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "<midi-program>54</midi-program>") {
+		t.Errorf("preserve-pitch must not change playback:\n%s", out.String())
+	}
+}

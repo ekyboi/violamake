@@ -47,9 +47,20 @@ by exactly seven semitones.
 You need Go (the module targets 1.27) to build, plus two external tools.
 
 ```sh
-git clone <this repo> && cd violamake
+go install github.com/ekyboi/violamake@latest
+```
+
+Or build from a clone:
+
+```sh
+git clone https://github.com/ekyboi/violamake.git && cd violamake
 go build -o violamake .
 ```
+
+The only Go dependency is [`ledongthuc/pdf`][pdflib], used to read chord symbols
+from a PDF's text layer. It has no dependencies of its own.
+
+[pdflib]: https://github.com/ledongthuc/pdf
 
 **Recognition (only needed for PDF input)** — [Audiveris][av], an optical music
 recognition engine. Download the installer for your platform and, on macOS, drag
@@ -123,8 +134,22 @@ on the page agrees with everything else.
 - **Chord symbols** — root and bass move with the music, F♯ exception included.
   A part sounding in G major that still prints D-major chord symbols is useless
   to anyone comping from it.
+- **Misread chord roots** — recognition reads chord symbols with OCR, which
+  confuses letters of similar shape: a printed `Bm` comes back as `Em`. The
+  mistake is undetectable downstream, because a wrong chord is still a valid
+  chord. When the source PDF was engraved it carries a text layer holding those
+  symbols exactly, so `violamake` reads them from the page and restores any root
+  that disagrees, before transposing. See *Chord correction* below.
 - **Part names** — "Violin" becomes "Viola", including the `Vln.`/`Vn.`
   abbreviations, in part names, instrument names and credits.
+- **Placeholder part names** — recognition often fails to link the instrument
+  name printed on the page to the staff below it, leaving a generic label such
+  as "Voice". When a credit on the page names a violin, that placeholder is
+  corrected and the playback patch is set to viola. A part with a real name that
+  is not a violin is never touched, so a piano staff in the same file is safe.
+- **Scraped page text** — recognition sometimes mistakes measure numbers in the
+  left margin for page credits, which then print as stray lines in the header.
+  Credits consisting only of digits are dropped.
 
 Under `-preserve-pitch`, only the clef and part name change.
 
@@ -152,6 +177,31 @@ still cleaning up first.
 different path, a symlink or a different letter case. If a run fails, a file
 that was already at the output path is left exactly as it was found.
 
+## Chord correction
+
+Optical recognition reads chord symbols as images and runs OCR over them. On a
+short string in a serif face that is unreliable: in the sample score a printed
+`Bm` came back as `Em`. Nothing downstream can catch this, since `Em` is a
+perfectly valid chord — it just is not the one on the page.
+
+An engraved PDF, though, stores its text as character codes, not shapes. Those
+codes are exact. So when the input is a PDF, `violamake` reads the chord symbols
+from the text layer and compares them against what recognition produced.
+
+The two lists are *aligned* rather than compared position by position, because
+recognition regularly drops chords: in the sample it found 14 of the 17 printed.
+A positional comparison would shift at the first omission and then rewrite every
+chord after it. An alignment tolerates gaps on either side, so only genuine
+disagreements are corrected and the chords recognition got right are untouched.
+
+Only the root is corrected, and only when the two sources disagree about it.
+Chord quality (`m`, `7`, `dim`) is left as recognition read it. A chord that is
+missing from the recognized score is left missing, since placing it would mean
+guessing its measure and beat.
+
+If the PDF has no text layer — any scan — there is nothing to compare against,
+and the score is converted on recognition alone.
+
 ## Layout
 
 | File | Contents |
@@ -160,12 +210,13 @@ that was already at the output path is left exactly as it was found.
 | `pipeline.go` | Dependency checking, subprocess orchestration, renderer quirks |
 | `transposer.go` | The streaming XML transposition engine |
 | `mxl.go` | Unwraps compressed `.mxl` archives |
+| `chords.go` | Reads chord symbols from the PDF text layer and reconciles them |
 | `proc_unix.go` / `proc_other.go` | Process-group teardown, per platform |
 
 ## Tests
 
 ```sh
-go test ./...          # 21 tests
+go test ./...          # 34 tests
 go test -race ./...
 ```
 
@@ -182,10 +233,13 @@ These come from the recognition stage, not the transposer.
   as articulations, and it does not always get rhythms right on complex
   notation. Check the output before rehearsal — and keep the intermediate
   MusicXML (`-v` shows its path) if you want to correct it by hand.
-- **Parts are sometimes named "Voice".** Audiveris assigns a generic name when
-  it cannot read the original label. `violamake` renames *violin* labels, but
-  will not rename an arbitrary part, since that would be wrong on a score with
-  several instruments.
+- **Chord correction needs a text layer.** Misread chord roots are corrected
+  automatically from the source PDF (see below), but only when that PDF was
+  engraved rather than scanned. A scan has no text to compare against, so its
+  chords are whatever recognition made of them — spot-check those.
+- **Chords recognition misses entirely are not invented.** If a chord is absent
+  from the recognized score, it stays absent. Restoring it would mean guessing
+  which measure and beat it belongs to.
 - **Only the LilyPond path is unverified.** The Verovio path is tested end to
   end; the LilyPond branch is written against its documented interface but has
   not been run against a live binary.

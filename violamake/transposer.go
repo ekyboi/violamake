@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -64,6 +65,11 @@ type Stats struct {
 	PartNames   int
 	Harmonies   int
 	Accidentals int
+	// DroppedCredits counts page text discarded as OMR noise.
+	DroppedCredits int
+	// CorrectedChords counts chords whose root was restored from the source
+	// PDF's text layer after recognition misread it.
+	CorrectedChords int
 }
 
 // pitch mirrors the MusicXML <pitch> element. Order matters on output: the
@@ -140,9 +146,16 @@ func alterSuffix(alter int) string {
 // document tree, so memory stays flat regardless of score length -- a full
 // symphony costs the same as a single page.
 func Transpose(r io.Reader, w io.Writer, preservePitch bool) (Stats, error) {
+	return TransposeWithCorrections(r, w, preservePitch, nil)
+}
+
+// TransposeWithCorrections is Transpose with a set of chord-root corrections
+// derived from the source PDF's text layer, applied before transposition so the
+// corrected root is what gets moved down a fifth.
+func TransposeWithCorrections(r io.Reader, w io.Writer, preservePitch bool, corrections []chordCorrection) (Stats, error) {
 	var st Stats
 	// Per-call state keeps concurrent Transpose calls independent.
-	state := &transposeState{}
+	state := &transposeState{corrections: indexCorrections(corrections)}
 
 	dec := xml.NewDecoder(r)
 	// Scores from OMR tools reference DTDs we neither have nor need, and may
@@ -219,6 +232,19 @@ func Transpose(r io.Reader, w io.Writer, preservePitch bool) (Stats, error) {
 				st.Accidentals += n
 				continue
 
+			case "print":
+				// A new system resets the chord counter, which is how a
+				// correction derived from the page is located in the stream.
+				for _, a := range se.Attr {
+					if a.Name.Local == "new-system" && a.Value == "yes" {
+						if state.seenSystem {
+							state.system++
+						}
+						state.chordIndex = 0
+					}
+				}
+				state.seenSystem = true
+
 			case "root-step", "bass-step":
 				// Chord symbols must move with the music. Leaving them behind
 				// would print D-major harmony over a part sounding in G.
@@ -241,9 +267,47 @@ func Transpose(r io.Reader, w io.Writer, preservePitch bool) (Stats, error) {
 				}
 				continue
 
-			case "part-name", "part-abbreviation", "instrument-name", "credit-words":
+			case "credit":
+				// Buffer the whole wrapper so a credit whose only content was
+				// OMR noise can be removed entirely, rather than leaving an
+				// empty <credit> element behind.
+				n, dropped, err := state.rewriteCreditBlock(dec, enc, &se)
+				if err != nil {
+					return st, err
+				}
+				st.PartNames += n
+				st.DroppedCredits += dropped
+				continue
+
+			case "credit-words":
+				// Credits carry the visible page text. They are also where OMR
+				// tools deposit anything they could not identify, including
+				// stray measure numbers scraped off the left margin.
+				n, dropped, err := state.rewriteCredit(dec, enc, &se)
+				if err != nil {
+					return st, err
+				}
+				st.PartNames += n
+				st.DroppedCredits += dropped
+				continue
+
+			case "midi-program":
+				// A part relabelled as viola should also play back as one.
+				// Audiveris guesses a voice patch when it cannot identify the
+				// instrument, which sounds like a choir on playback.
+				if preservePitch {
+					break
+				}
+				n, err := state.rewriteMidiProgram(dec, enc, &se)
+				if err != nil {
+					return st, err
+				}
+				st.PartNames += n
+				continue
+
+			case "part-name", "part-abbreviation", "instrument-name":
 				// A part still labeled "Violin" on a viola stand is a nuisance.
-				n, err := rewritePartName(dec, enc, &se)
+				n, err := state.rewritePartName(dec, enc, &se)
 				if err != nil {
 					return st, err
 				}
@@ -271,6 +335,7 @@ func Transpose(r io.Reader, w io.Writer, preservePitch bool) (Stats, error) {
 	if err := enc.Flush(); err != nil {
 		return st, fmt.Errorf("flushing output: %w", err)
 	}
+	st.CorrectedChords = state.appliedCorrections
 	return st, nil
 }
 
@@ -482,6 +547,28 @@ func rewriteKey(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, 
 // the step's tritone correction is recorded here for the alter that follows.
 type transposeState struct {
 	pendingAlter int
+	// sawViolinCredit records that a credit on the page names a violin. OMR
+	// tools frequently fail to link that text to the staff and fall back to a
+	// generic part name, so the credit is the only surviving evidence of what
+	// the part actually is.
+	sawViolinCredit bool
+	// renamedPart records that this part was identified as a violin part and
+	// relabelled, which is the precondition for touching its playback patch.
+	renamedPart bool
+
+	// corrections maps a chord's position in reading order to the root the
+	// source page actually shows, keyed by system and index within it.
+	corrections map[[2]int]chordCorrection
+	// system and chordIndex track position while streaming, so each harmony can
+	// be matched against the corrections computed from the PDF.
+	system     int
+	chordIndex int
+	seenSystem bool
+	// correctedChord holds a correction awaiting its <root-alter>, so the
+	// alteration printed on the page replaces the recognized one.
+	correctedChord *chordCorrection
+	// appliedCorrections counts corrections actually reached in the stream.
+	appliedCorrections int
 	// lastAlter is the alteration of the most recently transposed <pitch>,
 	// used to rewrite the <accidental> that follows it within the same <note>.
 	lastAlter int
@@ -499,6 +586,20 @@ func (t *transposeState) rewriteRootStep(dec *xml.Decoder, enc *xml.Encoder, se 
 	}
 
 	key := strings.ToUpper(strings.TrimSpace(step))
+
+	// A root the source page disagrees with is corrected before transposition,
+	// so the fifth is taken from the chord that was actually printed. Only
+	// <root-step> is counted and corrected; <bass-step> rides along with it.
+	if se.Name.Local == "root-step" {
+		pos := [2]int{t.system, t.chordIndex}
+		t.chordIndex++
+		if c, found := t.corrections[pos]; found {
+			key = c.step
+			t.correctedChord = &c
+			t.appliedCorrections++
+		}
+	}
+
 	m, ok := fifthDown[key]
 	if !ok {
 		t.pendingAlter = 0
@@ -522,11 +623,29 @@ func (t *transposeState) rewriteRootAlter(dec *xml.Decoder, enc *xml.Encoder, se
 	if err := dec.DecodeElement(&alter, se); err != nil {
 		return fmt.Errorf("decoding <%s>: %w", se.Name.Local, err)
 	}
+	// Take the alteration from the page too, not just the letter.
+	if t.correctedChord != nil && se.Name.Local == "root-alter" {
+		alter = t.correctedChord.alter
+		t.correctedChord = nil
+	}
 	if err := enc.EncodeElement(alter+t.pendingAlter, *se); err != nil {
 		return fmt.Errorf("encoding <%s>: %w", se.Name.Local, err)
 	}
 	t.pendingAlter = 0
 	return nil
+}
+
+// indexCorrections keys corrections by their position in reading order so the
+// streaming rewriter can find each one in constant time.
+func indexCorrections(cs []chordCorrection) map[[2]int]chordCorrection {
+	if len(cs) == 0 {
+		return nil
+	}
+	m := make(map[[2]int]chordCorrection, len(cs))
+	for _, c := range cs {
+		m[[2]int{c.system, c.index}] = c
+	}
+	return m
 }
 
 // violinNaming matches the instrument word in a part label, in the common
@@ -541,24 +660,194 @@ var violinNaming = strings.NewReplacer(
 	"Vn", "Va",
 )
 
-// rewritePartName relabels a violin part as viola, leaving any other
-// instrument name (or a part already named viola) untouched.
-func rewritePartName(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, error) {
+// genericPartNames are the placeholders OMR tools assign when they cannot read
+// a part's real label. Audiveris defaults to "Voice"; others use similar stand-in
+// names. A placeholder carries no information, so it is safe to replace when the
+// page itself says what the instrument is.
+var genericPartNames = map[string]bool{
+	"voice":      true,
+	"voice oohs": true,
+	"part":       true,
+	"unnamed":    true,
+	"instrument": true,
+	"":           true,
+}
+
+// rewritePartName relabels a violin part as viola.
+//
+// Two cases are handled. The straightforward one is a label that actually says
+// "Violin". The second arises because OMR frequently fails to link the
+// instrument name printed at the top of the page to the staff beneath it, and
+// falls back to a placeholder such as "Voice". When that happens and a credit
+// on the page does name a violin, the placeholder is replaced rather than left
+// to mislabel the part -- the evidence is already in the document.
+//
+// A part with a real name that is not a violin is never touched: relabelling
+// every part would be wrong on a score that contains more than one instrument.
+func (t *transposeState) rewritePartName(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, error) {
 	var name string
 	if err := dec.DecodeElement(&name, se); err != nil {
 		return 0, fmt.Errorf("decoding <%s>: %w", se.Name.Local, err)
 	}
 
 	changed := 0
-	if renamed := violinNaming.Replace(name); renamed != name {
-		name = renamed
+	switch {
+	case violinNaming.Replace(name) != name:
+		name = violinNaming.Replace(name)
 		changed = 1
+
+	case t.sawViolinCredit && genericPartNames[strings.ToLower(strings.TrimSpace(name))]:
+		// The recognizer gave up on the label; the page did not.
+		name = "Viola"
+		changed = 1
+	}
+	if changed == 1 {
+		t.renamedPart = true
 	}
 
 	if err := enc.EncodeElement(name, *se); err != nil {
 		return 0, fmt.Errorf("encoding <%s>: %w", se.Name.Local, err)
 	}
 	return changed, nil
+}
+
+// rewriteCreditBlock processes an entire <credit> element. The wrapper is only
+// emitted if some visible text survives, so a credit that held nothing but a
+// scraped measure number disappears cleanly instead of leaving an empty shell.
+func (t *transposeState) rewriteCreditBlock(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, int, error) {
+	// Collected tokens are replayed only if some visible text survives.
+	var pending []xml.Token
+	renamed, dropped, kept := 0, 0, 0
+	depth := 0
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return 0, 0, fmt.Errorf("reading <credit>: %w", err)
+		}
+		tok = stripNamespace(tok)
+
+		if s, ok := tok.(xml.StartElement); ok && s.Name.Local == "credit-words" {
+			var text string
+			if err := dec.DecodeElement(&text, &s); err != nil {
+				return 0, 0, fmt.Errorf("decoding <credit-words>: %w", err)
+			}
+			keep, n := t.creditText(&text)
+			if !keep {
+				dropped++
+				continue
+			}
+			kept++
+			renamed += n
+			pending = append(pending, s, xml.CharData(text), s.End())
+			continue
+		}
+
+		if s, ok := tok.(xml.StartElement); ok {
+			depth++
+			pending = append(pending, s)
+			continue
+		}
+		if e, ok := tok.(xml.EndElement); ok {
+			if depth == 0 && e.Name.Local == se.Name.Local {
+				break
+			}
+			depth--
+			pending = append(pending, e)
+			continue
+		}
+		pending = append(pending, xml.CopyToken(tok))
+	}
+
+	// Nothing visible left: drop the wrapper along with its contents.
+	if kept == 0 {
+		return renamed, dropped, nil
+	}
+
+	if err := enc.EncodeToken(*se); err != nil {
+		return 0, 0, fmt.Errorf("encoding <credit>: %w", err)
+	}
+	for _, tok := range pending {
+		if err := enc.EncodeToken(tok); err != nil {
+			return 0, 0, fmt.Errorf("encoding <credit>: %w", err)
+		}
+	}
+	if err := enc.EncodeToken(se.End()); err != nil {
+		return 0, 0, fmt.Errorf("encoding <credit>: %w", err)
+	}
+	return renamed, dropped, nil
+}
+
+// violaMidiProgram is General MIDI program 42 (Viola), one-based as MusicXML
+// writes it.
+const violaMidiProgram = 42
+
+// rewriteMidiProgram points playback at a viola patch, but only for a part this
+// engine has already decided is a violin part. Without that check a percussion
+// or piano staff in the same file would be silently reassigned.
+func (t *transposeState) rewriteMidiProgram(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, error) {
+	var program int
+	if err := dec.DecodeElement(&program, se); err != nil {
+		return 0, fmt.Errorf("decoding <midi-program>: %w", err)
+	}
+
+	changed := 0
+	if t.renamedPart && program != violaMidiProgram {
+		program = violaMidiProgram
+		changed = 1
+	}
+
+	if err := enc.EncodeElement(program, *se); err != nil {
+		return 0, fmt.Errorf("encoding <midi-program>: %w", err)
+	}
+	return changed, nil
+}
+
+// measureNumberCredit matches a credit consisting only of digits. Real credits
+// are titles, composers, dedications or performance directions; a bare number is
+// a measure number the recognizer scraped off the left margin and mistook for
+// page text. Left in place it prints as a stray line in the header.
+var measureNumberCredit = regexp.MustCompile(`^\d{1,4}$`)
+
+// creditText decides the fate of one credit string, rewriting it in place. It
+// reports whether the credit should be kept, and whether it was renamed.
+func (t *transposeState) creditText(text *string) (keep bool, renamed int) {
+	if measureNumberCredit.MatchString(strings.TrimSpace(*text)) {
+		return false, 0
+	}
+
+	// Record that the page names a violin before rewriting the text, so a later
+	// generic part name can be corrected. Credits precede the part list in a
+	// MusicXML document, so this is always set in time.
+	lower := strings.ToLower(*text)
+	if strings.Contains(lower, "violin") || strings.Contains(lower, "vln") {
+		t.sawViolinCredit = true
+	}
+
+	if s := violinNaming.Replace(*text); s != *text {
+		*text = s
+		return true, 1
+	}
+	return true, 0
+}
+
+// rewriteCredit handles a <credit-words> element encountered outside any
+// <credit> wrapper, which is unusual but permitted.
+func (t *transposeState) rewriteCredit(dec *xml.Decoder, enc *xml.Encoder, se *xml.StartElement) (int, int, error) {
+	var text string
+	if err := dec.DecodeElement(&text, se); err != nil {
+		return 0, 0, fmt.Errorf("decoding <credit-words>: %w", err)
+	}
+
+	keep, renamed := t.creditText(&text)
+	if !keep {
+		return 0, 1, nil
+	}
+
+	if err := enc.EncodeElement(text, *se); err != nil {
+		return 0, 0, fmt.Errorf("encoding <credit-words>: %w", err)
+	}
+	return renamed, 0, nil
 }
 
 // String renders the stats as the one-line summary the CLI prints on success.
@@ -574,6 +863,11 @@ func (s Stats) String() string {
 		b.WriteString(", ")
 		b.WriteString(strconv.Itoa(s.Harmonies))
 		b.WriteString(" chord symbol(s) transposed")
+	}
+	if s.CorrectedChords > 0 {
+		b.WriteString(", ")
+		b.WriteString(strconv.Itoa(s.CorrectedChords))
+		b.WriteString(" chord(s) corrected from the source PDF")
 	}
 	if s.PartNames > 0 {
 		b.WriteString(", ")
